@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Passkey-PRF POC</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.5 -apple-system, system-ui, sans-serif; margin: 0; padding: 16px 16px 64px; max-width: 680px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { opacity: .7; font-size: 13px; margin: 0 0 16px; }
+  fieldset { border: 1px solid #8884; border-radius: 12px; margin: 0 0 14px; padding: 12px 14px; }
+  legend { font-weight: 600; padding: 0 6px; }
+  button { font: inherit; font-weight: 600; padding: 12px 14px; border: 0; border-radius: 10px;
+           background: #2563eb; color: #fff; width: 100%; margin: 6px 0; }
+  button:disabled { opacity: .4; }
+  textarea { width: 100%; box-sizing: border-box; font: 14px/1.4 ui-monospace, monospace;
+             border-radius: 10px; border: 1px solid #8886; padding: 8px; min-height: 60px; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+  .ok  { background: #16a34a22; color: #16a34a; }
+  .bad { background: #dc262622; color: #dc2626; }
+  .warn{ background: #d9770622; color: #d97706; }
+  #log { white-space: pre-wrap; word-break: break-word; font: 12.5px/1.5 ui-monospace, monospace;
+         background: #8881; border-radius: 10px; padding: 10px; margin-top: 8px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 4px 0; }
+  .out { font-weight: 700; }
+  code { background: #8882; padding: 1px 5px; border-radius: 5px; }
+</style>
+</head>
+<body>
+  <h1>Passkey-PRF POC</h1>
+  <p class="sub">Proves: FaceID/passkey → WebAuthn <code>prf</code> secret → AES-GCM decrypt, client-side only.
+     The host (GitHub Pages) only ever holds ciphertext. Open this <b>inside Telegram</b> and <b>in Safari</b> and compare.</p>
+
+  <fieldset>
+    <legend>Environment</legend>
+    <div class="row">In Telegram webview: <span id="env-tg" class="badge">…</span></div>
+    <div class="row">Secure context (HTTPS): <span id="env-secure" class="badge">…</span></div>
+    <div class="row">WebAuthn available: <span id="env-wa" class="badge">…</span></div>
+    <div class="row">Platform authenticator (FaceID/TouchID): <span id="env-uvpa" class="badge">…</span></div>
+    <div class="row">Conditional/PRF hints: <span id="env-prf" class="badge">…</span></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Step 1 — Register a passkey (needs <code>prf</code> support)</legend>
+    <button id="btn-register">Register passkey on this device</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>Step 2 — Seal a secret (FaceID → encrypt)</legend>
+    <textarea id="secret">This is David's private data. If you can read this after Unlock, the whole chain works.</textarea>
+    <button id="btn-seal" disabled>Seal it (encrypt with passkey-derived key)</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>Step 3 — Unlock (FaceID → decrypt)</legend>
+    <button id="btn-unlock" disabled>Unlock (the real test)</button>
+    <div class="row">Decrypted: <span id="plaintext" class="out">—</span></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Reset</legend>
+    <button id="btn-reset" style="background:#6b7280">Clear stored credential + ciphertext</button>
+  </fieldset>
+
+  <div id="log"></div>
+
+<script>
+// ───────────────────────── helpers ─────────────────────────
+const $ = (id) => document.getElementById(id);
+const logEl = $("log");
+function log(...a){ const s = a.map(x => typeof x === "string" ? x : JSON.stringify(x)).join(" ");
+  logEl.textContent += s + "\n"; console.log(...a); }
+function badge(el, kind, text){ el.className = "badge " + kind; el.textContent = text; }
+const enc = new TextEncoder(), dec = new TextDecoder();
+const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const unb64 = (s) => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+const rand = (n) => crypto.getRandomValues(new Uint8Array(n));
+
+// Stable salt → same PRF output → same key every unlock. Do not change after sealing.
+const PRF_SALT = enc.encode("walle-miniapp-poc/v1/aes-key");
+const RP_ID = location.hostname;             // e.g. <you>.github.io
+const LS = { cred: "poc.credId", ct: "poc.ciphertext", iv: "poc.iv" };
+
+// ───────────────────────── env probe ─────────────────────────
+async function probe(){
+  badge($("env-tg"), window.Telegram?.WebApp ? "warn" : "warn",
+        window.Telegram?.WebApp ? "YES (Telegram)" : "no (plain browser)");
+  badge($("env-secure"), window.isSecureContext ? "ok" : "bad", window.isSecureContext ? "yes" : "NO");
+  const hasWA = !!(window.PublicKeyCredential && navigator.credentials);
+  badge($("env-wa"), hasWA ? "ok" : "bad", hasWA ? "yes" : "NO");
+  if (!hasWA){ badge($("env-uvpa"),"bad","n/a"); badge($("env-prf"),"bad","n/a");
+    log("WebAuthn API not present — this environment can't do passkeys at all."); return; }
+  try {
+    const uvpa = await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+    badge($("env-uvpa"), uvpa ? "ok" : "bad", uvpa ? "yes" : "NO");
+  } catch(e){ badge($("env-uvpa"),"bad","err"); log("uvpa check error:", String(e)); }
+  // There's no reliable static "is PRF supported" probe — you learn it at create()/get().
+  badge($("env-prf"), "warn", "decided at register/unlock");
+  try { if (window.Telegram?.WebApp){ Telegram.WebApp.ready(); Telegram.WebApp.expand();
+    log("Telegram WebApp version:", Telegram.WebApp.version, "platform:", Telegram.WebApp.platform); } } catch(_){}
+  log("origin:", location.origin, "| rpId:", RP_ID);
+  refreshButtons();
+}
+function refreshButtons(){
+  const haveCred = !!localStorage.getItem(LS.cred);
+  const haveCt = !!localStorage.getItem(LS.ct);
+  $("btn-seal").disabled = !haveCred;
+  $("btn-unlock").disabled = !(haveCred && haveCt);
+}
+
+// ───────────────────────── PRF core ─────────────────────────
+// Run a get() asserting our credential and asking for the prf secret at PRF_SALT.
+async function getPrfSecret(){
+  const credId = localStorage.getItem(LS.cred);
+  if (!credId) throw new Error("no registered credential — do Step 1 first");
+  const assertion = await navigator.credentials.get({
+    publicKey: {
+      challenge: rand(32),
+      rpId: RP_ID,
+      allowCredentials: [{ type: "public-key", id: unb64(credId) }],
+      userVerification: "required",
+      extensions: { prf: { eval: { first: PRF_SALT } } },
+    },
+  });
+  const ext = assertion.getClientExtensionResults();
+  const first = ext?.prf?.results?.first;
+  if (!first) throw new Error("PRF returned no secret in this environment (prf results.first empty). "
+                            + "ext=" + JSON.stringify(ext));
+  return new Uint8Array(first);            // 32 bytes of authenticator-derived secret
+}
+async function aesKeyFromPrf(prfBytes){
+  // HKDF the PRF output into a 256-bit AES-GCM key (robust regardless of prf length).
+  const km = await crypto.subtle.importKey("raw", prfBytes, "HKDF", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey(
+    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0), info: enc.encode("aes-gcm-256") },
+    km, { name: "AES-GCM", length: 256 }, false, ["encrypt","decrypt"]);
+}
+
+// ───────────────────────── steps ─────────────────────────
+$("btn-register").onclick = async () => {
+  try {
+    log("\n[1] Registering passkey…");
+    const cred = await navigator.credentials.create({
+      publicKey: {
+        challenge: rand(32),
+        rp: { name: "Passkey-PRF POC", id: RP_ID },
+        user: { id: rand(16), name: "david-poc", displayName: "David POC" },
+        pubKeyCredParams: [{ type:"public-key", alg:-7 }, { type:"public-key", alg:-257 }],
+        authenticatorSelection: { residentKey:"preferred", userVerification:"required" },
+        extensions: { prf: {} },           // request PRF capability
+      },
+    });
+    const ext = cred.getClientExtensionResults();
+    const prfEnabled = ext?.prf?.enabled;
+    log("  created. clientExtensionResults:", JSON.stringify(ext));
+    if (prfEnabled === true) badge($("env-prf"),"ok","PRF supported ✅");
+    else if (prfEnabled === false){ badge($("env-prf"),"bad","PRF NOT supported ❌");
+      log("  ⚠️ Authenticator says prf.enabled=false — Option A won't work here as-is."); }
+    else { badge($("env-prf"),"warn","prf.enabled undefined (will learn at Unlock)");
+      log("  ℹ️ prf.enabled undefined at create — some platforms only reveal PRF at get(). Continue."); }
+    localStorage.setItem(LS.cred, b64(cred.rawId));
+    log("  stored credId. Now run Step 2.");
+    refreshButtons();
+  } catch(e){ log("  ❌ register failed:", String(e), e?.name||""); }
+};
+
+$("btn-seal").onclick = async () => {
+  try {
+    log("\n[2] Sealing — FaceID to derive key, then AES-GCM encrypt…");
+    const prf = await getPrfSecret();
+    log("  PRF secret obtained (" + prf.length + " bytes). Deriving AES key…");
+    const key = await aesKeyFromPrf(prf);
+    const iv = rand(12);
+    const ct = await crypto.subtle.encrypt({ name:"AES-GCM", iv }, key, enc.encode($("secret").value));
+    localStorage.setItem(LS.ct, b64(ct));
+    localStorage.setItem(LS.iv, b64(iv));
+    log("  ✅ sealed. Ciphertext stored (this is all the host would ever hold). Now Step 3.");
+    refreshButtons();
+  } catch(e){ log("  ❌ seal failed:", String(e), e?.name||""); }
+};
+
+$("btn-unlock").onclick = async () => {
+  try {
+    $("plaintext").textContent = "…";
+    log("\n[3] Unlock — FaceID to derive key, then decrypt…");
+    const prf = await getPrfSecret();
+    const key = await aesKeyFromPrf(prf);
+    const ct = unb64(localStorage.getItem(LS.ct));
+    const iv = unb64(localStorage.getItem(LS.iv));
+    const pt = await crypto.subtle.decrypt({ name:"AES-GCM", iv }, key, ct);
+    const text = dec.decode(pt);
+    $("plaintext").textContent = text;
+    log("  ✅✅ DECRYPTED. The full chain works in this environment:");
+    log("      FaceID → passkey PRF → AES key → plaintext. " + text.length + " chars recovered.");
+  } catch(e){ $("plaintext").textContent = "(failed)";
+    log("  ❌ unlock failed:", String(e), e?.name||"",
+        "\n     If seal worked but unlock fails, the PRF secret wasn't stable across calls."); }
+};
+
+$("btn-reset").onclick = () => { Object.values(LS).forEach(k => localStorage.removeItem(k));
+  $("plaintext").textContent = "—"; log("\n[reset] cleared stored credId + ciphertext."); refreshButtons(); };
+
+probe();
+</script>
+</body>
+</html>
