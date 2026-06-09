@@ -1,0 +1,97 @@
+<!doctype html>
+<!--
+  WALLE mini-app tools — THROWAWAY round-trip POC page.
+
+  Purpose: prove the gateway plugin's full loop end to end —
+    WALLE emits `MINIAPP:<url>` → telegram-miniapp adapter sends a reply-keyboard
+    web_app button → David taps it → THIS page opens inside Telegram → David
+    submits → Telegram.WebApp.sendData(payload) → a `web_app_data` update reaches
+    the adapter → it feeds the payload to WALLE → WALLE replies.
+
+  This is a DISPOSABLE test artifact (not a WALLE-authored production mini-app),
+  so it references Telegram's official web-app SDK from telegram.org. PRODUCTION
+  mini-apps must SELF-HOST their assets (locked decision #2: no runtime external
+  fetches) and will be vetted by the review gate. Delete this repo once the
+  round-trip is proven.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>WALLE mini-app round-trip POC</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: -apple-system, system-ui, sans-serif;
+      margin: 0; padding: 24px;
+      background: var(--tg-theme-bg-color, #fff);
+      color: var(--tg-theme-text-color, #111);
+    }
+    h1 { font-size: 1.15rem; margin: 0 0 4px; }
+    p  { font-size: .9rem; opacity: .8; margin: 0 0 20px; }
+    label { display: block; font-size: .85rem; margin: 16px 0 6px; font-weight: 600; }
+    select, input {
+      width: 100%; box-sizing: border-box; padding: 10px 12px; font-size: 1rem;
+      border: 1px solid var(--tg-theme-hint-color, #ccc); border-radius: 10px;
+      background: var(--tg-theme-secondary-bg-color, #f6f6f6);
+      color: var(--tg-theme-text-color, #111);
+    }
+    button {
+      margin-top: 24px; width: 100%; padding: 14px; font-size: 1rem; font-weight: 600;
+      border: 0; border-radius: 12px; cursor: pointer;
+      background: var(--tg-theme-button-color, #2ea6ff);
+      color: var(--tg-theme-button-text-color, #fff);
+    }
+    .env { margin-top: 20px; font-size: .75rem; opacity: .6; white-space: pre-wrap; word-break: break-all; }
+  </style>
+</head>
+<body>
+  <h1>Round-trip POC</h1>
+  <p>Pick something and submit. The form's data is sent straight back to WALLE.</p>
+
+  <label for="topic">What should WALLE tell you about?</label>
+  <select id="topic">
+    <option value="weather">Today's weather</option>
+    <option value="joke">A joke</option>
+    <option value="time">The current time</option>
+  </select>
+
+  <label for="note">Optional note</label>
+  <input id="note" type="text" placeholder="e.g. keep it short" />
+
+  <button id="submit">Send to WALLE</button>
+
+  <div class="env" id="env"></div>
+
+  <script>
+    const tg = window.Telegram && window.Telegram.WebApp;
+
+    if (tg) {
+      tg.ready();
+      tg.expand();
+      // Show whether we're really inside Telegram with a usable WebApp context.
+      document.getElementById("env").textContent =
+        "platform=" + tg.platform + "  version=" + tg.version;
+    } else {
+      document.getElementById("env").textContent =
+        "Not running inside Telegram (window.Telegram.WebApp is undefined).";
+    }
+
+    document.getElementById("submit").addEventListener("click", () => {
+      const payload = JSON.stringify({
+        tool: "round-trip-poc",
+        topic: document.getElementById("topic").value,
+        note: document.getElementById("note").value || null,
+      });
+      if (tg && typeof tg.sendData === "function") {
+        // sendData closes the web app and delivers a `web_app_data` service
+        // message to the bot. Only works from a reply-keyboard web_app button.
+        tg.sendData(payload);
+      } else {
+        alert("sendData unavailable — open this from the bot's reply-keyboard button.\n\nPayload would be:\n" + payload);
+      }
+    });
+  </script>
+</body>
+</html>
